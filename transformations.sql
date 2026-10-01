@@ -1,86 +1,77 @@
--- ============================================================================
--- SCRIPT DE DESPLIEGUE FINAL: MODELO DE DATOS Y TRATAMIENTO DE ERRORES
--- BASE DE DATOS: analitica_inversiones
--- ENGINE: PostgreSQL 12+
--- ============================================================================
-
--- ============================================================================
--- PASO 1: LIMPIEZA DE OBJETOS PREVIOS
--- ============================================================================
-
-DROP VIEW IF EXISTS vista_auditoria_registros_corruptos CASCADE;
-DROP VIEW IF EXISTS vista_portafolio_usd CASCADE;
-DROP VIEW IF EXISTS vista_portafolio_cop CASCADE;
-
-DROP FUNCTION IF EXISTS safe_make_date(ANYELEMENT, ANYELEMENT, ANYELEMENT);
-DROP FUNCTION IF EXISTS safe_make_date(TEXT, TEXT, TEXT);
-DROP FUNCTION IF EXISTS safe_cast_numeric(ANYELEMENT);
-DROP FUNCTION IF EXISTS safe_cast_numeric(TEXT);
-
--- ============================================================================
--- PASO 2: FUNCIONES DE CASTEO SEGURO (SAFE CASTS)
--- Previene excepciones críticas ante formatos corruptos
--- ============================================================================
-
--- 2.1 Casteo seguro a NUMERIC (Maneja comas decimales y cadenas inválidas)
-CREATE OR REPLACE FUNCTION safe_cast_numeric(p_value TEXT) 
+-- 1. Función para limpiar y castear valores numéricos
+CREATE OR REPLACE FUNCTION safe_cast_numeric(p_value TEXT)
 RETURNS NUMERIC AS $$
 BEGIN
-    IF p_value IS NULL OR TRIM(p_value) = '' THEN 
-        RETURN NULL; 
+    IF p_value IS NULL OR TRIM(p_value) = '' THEN
+        RETURN 0.0;
     END IF;
     RETURN CAST(REPLACE(TRIM(p_value), ',', '.') AS NUMERIC);
 EXCEPTION WHEN OTHERS THEN
-    RETURN NULL;
+    RETURN 0.0;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
--- 2.2 Reconstrucción segura de FECHA con soporte a decimales en meses/días
-CREATE OR REPLACE FUNCTION safe_make_date(p_year TEXT, p_month TEXT, p_day TEXT) 
+-- 2. Función para parsear fechas de forma segura
+CREATE OR REPLACE FUNCTION safe_make_date(p_year TEXT, p_month TEXT, p_day TEXT)
 RETURNS DATE AS $$
 DECLARE
-    v_y INT;
-    v_m INT;
-    v_d INT;
+    v_year INT;
+    v_month INT;
+    v_day INT;
 BEGIN
-    IF p_year IS NULL OR p_month IS NULL OR p_day IS NULL THEN
+    v_year  := CAST(REGEXP_REPLACE(p_year, '[^0-9]', '', 'g') AS INT);
+    v_month := CAST(REGEXP_REPLACE(p_month, '[^0-9]', '', 'g') AS INT);
+    v_day   := CAST(REGEXP_REPLACE(p_day, '[^0-9]', '', 'g') AS INT);
+
+    IF v_year IS NULL OR v_month IS NULL OR v_day IS NULL THEN
         RETURN NULL;
     END IF;
 
-    -- Extrae la parte entera por si vienen flotantes (ej. '4.0')
-    v_y := CAST(SPLIT_PART(TRIM(p_year), '.', 1) AS INT);
-    v_m := CAST(SPLIT_PART(TRIM(p_month), '.', 1) AS INT);
-    v_d := CAST(SPLIT_PART(TRIM(p_day), '.', 1) AS INT);
-    
-    RETURN MAKE_DATE(v_y, v_m, v_d);
+    RETURN MAKE_DATE(v_year, v_month, v_day);
 EXCEPTION WHEN OTHERS THEN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
--- ============================================================================
--- PASO 3: VISTAS DEL NEGOCIO (CAPA GOLD)
--- ============================================================================
+-- 3. Función para limpiar IDs de clientes (Resuelve notación científica 1.00114E+12)
+CREATE OR REPLACE FUNCTION clean_client_id(p_value TEXT)
+RETURNS TEXT AS $$
+DECLARE
+    v_clean TEXT;
+BEGIN
+    IF p_value IS NULL OR TRIM(p_value) = '' THEN
+        RETURN NULL;
+    END IF;
 
--------------------------------------------------------------------------------
--- 3.1 Vista Portafolio Local (COP)
--------------------------------------------------------------------------------
-CREATE VIEW vista_portafolio_cop AS
+    v_clean := TRIM(p_value);
+
+    -- Si viene en notación científica E+12 o similar, expandirlo a entero
+    IF v_clean ~* '[0-9]+(\.[0-9]+)?E\+[0-9]+' THEN
+        RETURN CAST(CAST(v_clean AS NUMERIC) AS BIGINT)::text;
+    END IF;
+
+    -- Si es número estándar, quitar caracteres no numéricos
+    RETURN NULLIF(REGEXP_REPLACE(v_clean, '[^0-9]', '', 'g'), '');
+EXCEPTION WHEN OTHERS THEN
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- 4. VISTA PORTAFOLIO LOCAL (COP)
+CREATE OR REPLACE VIEW vista_portafolio_cop AS
 WITH datos_normalizados AS (
     SELECT 
         f.ingestion_year::text AS ingestion_year,
         f.ingestion_month::text AS ingestion_month,
         
-        -- Si el día viene pegado con la cédula, extrae los 2 primeros caracteres
         CASE 
             WHEN LENGTH(TRIM(f.ingestion_day::text)) > 2 THEN SUBSTRING(TRIM(f.ingestion_day::text) FROM 1 FOR 2)
             ELSE TRIM(f.ingestion_day::text)
         END AS ingestion_day_limpio,
         
-        NULLIF(REGEXP_REPLACE(TRIM(f.id_sistema_cliente::text), '[^0-9]', '', 'g'), '') AS id_sistema_cliente_limpio,
+        clean_client_id(f.id_sistema_cliente::text) AS id_sistema_cliente_limpio,
         NULLIF(REGEXP_REPLACE(TRIM(f.cod_activo::text), '[^0-9]', '', 'g'), '') AS cod_activo_limpio,
         
-        -- Limpia prefijos pegados como '100FICs' -> 'FICs'
         COALESCE(
             NULLIF(TRIM(REGEXP_REPLACE(f.macroactivo::text, '^[0-9]+', '')), ''),
             NULLIF(TRIM(f.macroactivo::text), ''),
@@ -109,53 +100,26 @@ LEFT JOIN catalogo_banca b ON dn.cod_banca = TRIM(b.cod_banca::text)
 
 WHERE dn.id_sistema_cliente_limpio IS NOT NULL;
 
-
--------------------------------------------------------------------------------
--- 3.2 Vista Portafolio USD Internacional
--------------------------------------------------------------------------------
-CREATE VIEW vista_portafolio_usd AS
+-- 5. VISTA PORTAFOLIO INTERNACIONAL (USD)
+CREATE OR REPLACE VIEW vista_portafolio_usd AS
+WITH datos_usd AS (
+    SELECT 
+        f.year::text AS year,
+        f.month::text AS month,
+        f.day::text AS day,
+        clean_client_id(f.id_sistema_cliente::text) AS id_sistema_cliente_limpio,
+        NULLIF(REGEXP_REPLACE(TRIM(f.cod_activo::text), '[^0-9]', '', 'g'), '') AS cod_activo_limpio,
+        f.saldo_usd::text AS saldo_usd_raw
+    FROM historico_posicion_usd f
+)
 SELECT 
-    safe_make_date(ingestion_year::text, ingestion_month::text, ingestion_day::text) AS fecha_corte,
-    
-    NULLIF(REGEXP_REPLACE(TRIM(id_sistema_cliente::text), '[^0-9]', '', 'g'), '') AS id_sistema_cliente,
-    NULLIF(TRIM(simbol::text), '') AS simbol,
-    NULLIF(TRIM(cusip::text), '') AS cusip,
-    NULLIF(TRIM(isin::text), '') AS isin,
-    
-    COALESCE(NULLIF(TRIM(nombre_activo::text), ''), NULLIF(TRIM(simbol::text), ''), 'ACTIVO INTERNACIONAL') AS nombre_activo,
-    
-    safe_cast_numeric(cantidad::text) AS cantidad,
-    safe_cast_numeric(valor_mercado::text) AS saldo_usd,
-    
-    CASE 
-        WHEN fecha_vencimiento::text IN ('1900-01-01', '1/01/1900', '01/01/1900') OR fecha_vencimiento IS NULL THEN NULL
-        ELSE TO_DATE(NULLIF(TRIM(fecha_vencimiento::text), ''), 'MM/DD/YYYY')
-    END AS fecha_vencimiento,
-    
-    CASE 
-        WHEN safe_cast_numeric(tasa_cupon::text) = 0 THEN NULL
-        ELSE safe_cast_numeric(tasa_cupon::text)
-    END AS tasa_cupon
+    safe_make_date(u.year, u.month, u.day) AS fecha_corte,
+    u.id_sistema_cliente_limpio AS id_sistema_cliente,
+    u.cod_activo_limpio AS cod_activo,
+    COALESCE(NULLIF(TRIM(a.activo::text), ''), 'SIN NOMBRE ASIGNADO') AS nombre_activo,
+    safe_cast_numeric(u.saldo_usd_raw) AS saldo_usd
 
-FROM historico_aba_usd_internacional
-WHERE NULLIF(TRIM(id_sistema_cliente::text), '') IS NOT NULL;
+FROM datos_usd u
+LEFT JOIN catalogo_activos a ON u.cod_activo_limpio = TRIM(a.cod_activo::text)
 
-
--- ============================================================================
--- PASO 4: VISTA DE AUDITORÍA Y CONTROL DE CALIDAD
--- ============================================================================
-
-CREATE VIEW vista_auditoria_registros_corruptos AS
-SELECT 
-    'historico_aba_macroactivos' AS tabla_origen,
-    f.id_sistema_cliente::text AS id_sistema_cliente,
-    COALESCE(f.ingestion_year::text, '') || '-' || COALESCE(f.ingestion_month::text, '') || '-' || COALESCE(f.ingestion_day::text, '') AS fecha_original,
-    f.aba::text AS saldo_original,
-    CASE 
-        WHEN safe_make_date(f.ingestion_year::text, f.ingestion_month::text, f.ingestion_day::text) IS NULL THEN 'Fecha Invalida / Formato Incorrecto'
-        WHEN safe_cast_numeric(f.aba::text) IS NULL THEN 'Saldo Invalido / No Numerico'
-        ELSE 'Otro error de formato'
-    END AS motivo_rechazo
-FROM historico_aba_macroactivos f
-WHERE safe_make_date(f.ingestion_year::text, f.ingestion_month::text, f.ingestion_day::text) IS NULL
-   OR safe_cast_numeric(f.aba::text) IS NULL;
+WHERE u.id_sistema_cliente_limpio IS NOT NULL;
