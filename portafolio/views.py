@@ -1,68 +1,56 @@
 import json
+from collections import defaultdict
+
 from django.shortcuts import render
-from django.db.models import Max
+
 from .models import PortafolioCOP, PortafolioUSD
 
+
+def _agrupar(filas, claves, saldo):
+    """Suma saldos por las claves dadas (evita filas repetidas en los gráficos)."""
+    acc = defaultdict(float)
+    for f in filas:
+        acc[tuple(f[k] for k in claves)] += float(f[saldo] or 0)
+    return [dict(zip(claves, k), **{saldo: v}) for k, v in acc.items()]
+
+
 def dashboard_view(request):
-    # 1. Obtener lista de clientes únicos (de ambas vistas)
-    clientes_cop = set(PortafolioCOP.objects.values_list('id_sistema_cliente', flat=True).distinct())
-    clientes_usd = set(PortafolioUSD.objects.values_list('id_sistema_cliente', flat=True).distinct())
-    lista_clientes = sorted(list(clientes_cop.union(clientes_usd)))
+    # Las tablas materializadas son pequeñas e indexadas: 4 consultas livianas en total
+    ids = set(PortafolioCOP.objects.values_list('id_sistema_cliente', flat=True))
+    ids |= set(PortafolioUSD.objects.values_list('id_sistema_cliente', flat=True))
+    normales = sorted(i for i in ids if not i.startswith('SCI-'))
+    aproximados = sorted(i for i in ids if i.startswith('SCI-'))
 
-    cliente_selected = request.GET.get('cliente', lista_clientes[0] if lista_clientes else None)
+    cliente = request.GET.get('cliente')
+    if cliente not in ids:
+        cliente = (normales + aproximados or [None])[0]
 
-    datos_cop = []
-    datos_usd = []
-    ultima_fecha_cop = None
-    ultima_fecha_usd = None
+    datos_cop, datos_usd = [], []
+    fecha_cop = fecha_usd = perfil = banca = None
 
-    if cliente_selected:
-        # --- PORTAFOLIO COP (Última fecha disponible para este cliente) ---
-        max_fecha_cop = PortafolioCOP.objects.filter(
-            id_sistema_cliente=cliente_selected
-        ).aggregate(Max('fecha_corte'))['fecha_corte__max']
+    if cliente:
+        filas = list(PortafolioCOP.objects.filter(id_sistema_cliente=cliente).values(
+            'fecha_corte', 'nombre_activo', 'macroactivo', 'perfil_riesgo', 'banca', 'saldo_cop'))
+        if filas:
+            fecha_cop = filas[0]['fecha_corte'].strftime('%Y-%m-%d')
+            perfil, banca = filas[0]['perfil_riesgo'], filas[0]['banca']
+            datos_cop = _agrupar(filas, ['nombre_activo', 'macroactivo'], 'saldo_cop')
 
-        if max_fecha_cop:
-            ultima_fecha_cop = max_fecha_cop.strftime('%Y-%m-%d')
-            qs_cop = PortafolioCOP.objects.filter(
-                id_sistema_cliente=cliente_selected,
-                fecha_corte=max_fecha_cop
-            )
-            datos_cop = [
-                {
-                    'nombre_activo': item.nombre_activo,
-                    'macroactivo': item.macroactivo,
-                    'saldo_cop': float(item.saldo_cop or 0)
-                }
-                for item in qs_cop
-            ]
+        filas = list(PortafolioUSD.objects.filter(id_sistema_cliente=cliente).values(
+            'fecha_corte', 'nombre_activo', 'saldo_usd'))
+        if filas:
+            fecha_usd = filas[0]['fecha_corte'].strftime('%Y-%m-%d')
+            datos_usd = _agrupar(filas, ['nombre_activo'], 'saldo_usd')
 
-        # --- PORTAFOLIO USD (Última fecha disponible para este cliente) ---
-        max_fecha_usd = PortafolioUSD.objects.filter(
-            id_sistema_cliente=cliente_selected
-        ).aggregate(Max('fecha_corte'))['fecha_corte__max']
-
-        if max_fecha_usd:
-            ultima_fecha_usd = max_fecha_usd.strftime('%Y-%m-%d')
-            qs_usd = PortafolioUSD.objects.filter(
-                id_sistema_cliente=cliente_selected,
-                fecha_corte=max_fecha_usd
-            )
-            datos_usd = [
-                {
-                    'nombre_activo': item.nombre_activo,
-                    'simbol': item.simbol or 'N/A',
-                    'saldo_usd': float(item.saldo_usd or 0)
-                }
-                for item in qs_usd
-            ]
-
-    context = {
-        'clientes': lista_clientes,
-        'cliente_selected': cliente_selected,
+    return render(request, 'portafolio/dashboard.html', {
+        'clientes': normales,
+        'clientes_aprox': aproximados,
+        'cliente_selected': cliente,
         'datos_cop_json': json.dumps(datos_cop),
         'datos_usd_json': json.dumps(datos_usd),
-        'ultima_fecha_cop': ultima_fecha_cop,
-        'ultima_fecha_usd': ultima_fecha_usd,
-    }
-    return render(request, 'portafolio/dashboard.html', context)
+        'ultima_fecha_cop': fecha_cop,
+        'ultima_fecha_usd': fecha_usd,
+        'perfil': perfil,
+        'banca': banca,
+        'id_aproximado': bool(cliente and cliente.startswith('SCI-')),
+    })

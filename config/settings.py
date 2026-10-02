@@ -73,17 +73,11 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'analitica_inversiones',
-        'USER': 'postgres',
-        'PASSWORD': '12345',
-        'HOST': 'localhost',
-        'PORT': '5433',
-    }
-}
-
+DATABASES = {"default": {
+    "ENGINE": "django.db.backends.postgresql", "NAME": "analitica_inversiones",
+    "USER": "postgres", "PASSWORD": "12345",
+    "HOST": "127.0.0.1", "PORT": "5433", "CONN_MAX_AGE": 600,
+}}
 
 # Password validation
 # https://docs.djangoproject.com/en/6.1/ref/settings/#auth-password-validators
