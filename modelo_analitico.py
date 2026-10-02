@@ -10,7 +10,9 @@ Uso:
     python modelo_analitico.py --trm 3900      # fija la TRM manualmente
 """
 import argparse
+import logging
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -18,6 +20,9 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
+
+# Silencia los avisos 404 / "possibly delisted" de yfinance
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASS = os.getenv("DB_PASS", "12345")
@@ -27,6 +32,25 @@ DB_NAME = os.getenv("DB_NAME", "analitica_inversiones")
 
 TRM_POR_DEFECTO = float(os.getenv("TRM_COP_USD", "3900"))   # aproximada: sustituir por la TRM del corte
 ACTIVOS_LIQUIDEZ_COP = ["Renta Liquidez", "Fiducuenta"]
+
+# Segmentación: k máximo y tamaño mínimo de cada segmento
+K_MAX = 4
+MIN_POR_SEGMENTO = 3          # un cluster con menos clientes se marca como atípico
+MAX_PCT_ATIPICOS = 0.10       # máx. 10% de los clientes pueden ser atípicos (29 clientes -> 2)
+
+# Tickers que cambiaron de nombre en Yahoo Finance
+ALIAS_TICKERS = {"SQ": "XYZ"}                               # Block cambió de ticker
+# Ticker válido: 1-5 letras, opcionalmente con sufijo de clase (BRK-B). Sin dígitos.
+_PATRON_TICKER = re.compile(r"^[A-Z]{1,5}([.-][A-Z])?$")
+
+
+def normalizar_simbolo(s):
+    """Devuelve un ticker válido para Yahoo o None si no lo es."""
+    if not isinstance(s, str):
+        return None
+    s = s.strip().upper().replace(" ", "-")
+    s = ALIAS_TICKERS.get(s, s)
+    return s if _PATRON_TICKER.match(s) else None
 
 
 # ----------------------------------------------------------------------------
@@ -48,9 +72,11 @@ def obtener_trm(fecha):
 
 def volatilidad_anual(simbolos, fecha):
     """Volatilidad anualizada a 1 año de cada símbolo. Devuelve {} si no hay internet."""
+    tickers = sorted({t for t in map(normalizar_simbolo, simbolos) if t})
+    if not tickers:
+        return {}
     try:
         import yfinance as yf
-        tickers = sorted({s.replace(" ", "-") for s in simbolos})
         h = yf.download(tickers, start=fecha - pd.Timedelta(days=365), end=fecha,
                         progress=False, auto_adjust=True)["Close"]
         if isinstance(h, pd.Series):
@@ -114,7 +140,8 @@ def construir_features(df_cop, df_usd, trm, vol=None):
     f_usd["vol_usd_ponderada"] = np.nan
     if vol:
         sub = usd[(usd["tipo_activo"] == "Acción / ETF") & usd["simbolo"].notna()].copy()
-        sub["vol"] = sub["simbolo"].str.replace(" ", "-").map(vol)
+        # Misma normalización que al consultar Yahoo (SQ -> XYZ, descarta códigos con números)
+        sub["vol"] = sub["simbolo"].map(normalizar_simbolo).map(vol)
         sub = sub.dropna(subset=["vol"])
         if not sub.empty:
             num = (sub["vol"] * sub["saldo_usd"]).groupby(sub[cid]).sum()
@@ -154,21 +181,42 @@ def segmentar(df):
         "pct_renta_fija": df["pct_renta_fija"],
     })
     n = len(df)
+    df["es_atipico"] = False
     if n < 6:
         df["cluster_id"], df["silhouette_k"], df["k"] = 0, np.nan, 1
     else:
         Xs = StandardScaler().fit_transform(X)
-        mejor = (-1.0, 2, None)
-        for k in range(2, min(6, n - 1) + 1):
+        max_atipicos = max(1, int(n * MAX_PCT_ATIPICOS))
+        mejor = (-1.0, 1, None, None)
+        for k in range(2, min(K_MAX, n - 1) + 1):
             etiquetas = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(Xs)
-            s = silhouette_score(Xs, etiquetas)
-            if s > mejor[0]:
-                mejor = (s, k, etiquetas)
-        df["cluster_id"], df["silhouette_k"], df["k"] = mejor[2], mejor[0], mejor[1]
+            tamanos = np.bincount(etiquetas)
+            chicos = np.where(tamanos < MIN_POR_SEGMENTO)[0]      # clusters con muy pocos clientes
+            es_at = np.isin(etiquetas, chicos)
+            n_at = int(es_at.sum())
+            n_seg = k - len(chicos)                               # segmentos "reales"
+            valido = n_seg >= 2 and n_at <= max_atipicos
+            if valido:
+                s = silhouette_score(Xs[~es_at], etiquetas[~es_at])   # silhouette sin atípicos
+                nota = f"silhouette (sin atípicos)={s:.3f} | atípicos={n_at}"
+            else:
+                s = np.nan
+                nota = "descartado: demasiados atípicos o menos de 2 segmentos reales"
+            print(f"   k={k}: tamaños={tamanos.tolist()} {nota}")
+            if valido and s > mejor[0]:
+                mejor = (s, k, etiquetas, es_at)
+        if mejor[2] is None:                  # ningún k cumple: un solo segmento
+            df["cluster_id"], df["silhouette_k"], df["k"] = 0, np.nan, 1
+        else:
+            df["cluster_id"], df["silhouette_k"], df["k"] = mejor[2], mejor[0], mejor[1]
+            df["es_atipico"] = mejor[3]
 
     q25, q75 = df["patrimonio_total_cop"].quantile([.25, .75])
     nombres = {}
     for cid_, d in df.groupby("cluster_id"):
+        if d["es_atipico"].all():
+            nombres[cid_] = f"C{cid_}: Atípico (revisión individual)"
+            continue
         tam = ("Patrimonio alto" if d["patrimonio_total_cop"].median() >= q75 else
                "Patrimonio bajo" if d["patrimonio_total_cop"].median() <= q25 else "Patrimonio medio")
         if d["pct_usd"].mean() > 0.20:
@@ -255,7 +303,8 @@ def main():
 
     print("2. Segmentación (K-Means, k por silhouette)")
     df = segmentar(df)
-    print(f"   k elegido: {int(df['k'].iloc[0])} | silhouette: {df['silhouette_k'].iloc[0]:.3f}")
+    print(f"   k elegido: {int(df['k'].iloc[0])} | silhouette: {df['silhouette_k'].iloc[0]:.3f} "
+          f"| clientes atípicos: {int(df['es_atipico'].sum())}")
 
     print("3. Next Best Action")
     df = recomendar(df)
